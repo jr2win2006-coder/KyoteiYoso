@@ -11,7 +11,10 @@ import streamlit as st
 
 # アナライザーモジュールの安全なインポート
 try:
-    from KyoteiYoso_analyzer import FanDataLoader, parse_odds3t, calculate_capital_allocation
+    from KyoteiYoso_analyzer import (
+        FanDataLoader, parse_odds3t, calculate_capital_allocation,
+        VENUE_MASTERS, generate_suji_recommendations, generate_venue_and_maxim_alerts
+    )
     fan_loader = FanDataLoader("fan2604.txt")
 except Exception:
     try:
@@ -25,15 +28,24 @@ except Exception:
             FanDataLoader = analyzer_mod.FanDataLoader
             parse_odds3t = analyzer_mod.parse_odds3t
             calculate_capital_allocation = analyzer_mod.calculate_capital_allocation
+            VENUE_MASTERS = getattr(analyzer_mod, "VENUE_MASTERS", {})
+            generate_suji_recommendations = getattr(analyzer_mod, "generate_suji_recommendations", None)
+            generate_venue_and_maxim_alerts = getattr(analyzer_mod, "generate_venue_and_maxim_alerts", None)
             fan_loader = FanDataLoader("fan2604.txt")
         else:
             fan_loader = None
             parse_odds3t = None
             calculate_capital_allocation = None
+            VENUE_MASTERS = {}
+            generate_suji_recommendations = None
+            generate_venue_and_maxim_alerts = None
     except Exception:
         fan_loader = None
         parse_odds3t = None
         calculate_capital_allocation = None
+        VENUE_MASTERS = {}
+        generate_suji_recommendations = None
+        generate_venue_and_maxim_alerts = None
 
 # ==========================================
 # 【初期値設定】デフォルトで選択する競艇場コード
@@ -179,12 +191,6 @@ def calculate_castle_v6_prediction(jcd: str, rno: int, date_str: str):
     
     c_pts = CASTLE_COURSE_POINTS.get(jcd, CASTLE_COURSE_POINTS["01"])
     
-    warnings = []
-    
-    for b_no, tilt_val in before_info.get("tilts", {}).items():
-        if tilt_val >= 2.0:
-            warnings.append(f"⚠️ 【チルト注意】{b_no}号艇のチルト角度が {tilt_val}° に跳ね上げられています（波乱の可能性高）。")
-            
     scores = {}
     details = {}
     
@@ -225,28 +231,30 @@ def calculate_castle_v6_prediction(jcd: str, rno: int, date_str: str):
         
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     rank_boats = [b for b, s in ranked]
-    top_score = ranked[0][1]
-    
-    top3_scores = [s for b, s in ranked[:3]]
-    if len(top3_scores) >= 3 and (top3_scores[0] == top3_scores[1] == top3_scores[2]):
-        warnings.append("⚠️ 【見送り推奨】合計点数のトップ（1位）に3名が同点で並んでいます（超難解混戦レース）。")
-        
     r1, r2, r3, r4, r5, r6 = rank_boats
     
     va_lines = [f"{r1}-{r2}-{r3}", f"{r1}-{r2}-{r4}", f"{r1}-{r2}-{r5}", f"{r1}-{r2}-{r6}", f"{r1}-{r3}-{r2}", f"{r1}-{r3}-{r4}"]
     vb_lines = [f"{r2}-{r1}-{r3}", f"{r2}-{r1}-{r4}", f"{r2}-{r3}-{r1}", f"{r2}-{r3}-{r4}"]
     
-    va_odds = [odds_dict.get(combo, 0.0) for combo in va_lines]
-    vb_odds = [odds_dict.get(combo, 0.0) for combo in vb_lines]
+    suji_lines, suji_expl = generate_suji_recommendations(r1, r2, r3, r4, r5, r6, jcd, rno) if generate_suji_recommendations else ([], [])
+    alerts = generate_venue_and_maxim_alerts(jcd, rno, racers_map, before_info, fan_loader, rank_boats) if generate_venue_and_maxim_alerts else []
     
+    top3_scores = [s for b, s in ranked[:3]]
+    if len(top3_scores) >= 3 and (top3_scores[0] == top3_scores[1] == top3_scores[2]):
+        alerts.insert(0, "⚠️ 【見送り推奨】合計点数のトップ（1位）に3名が同点で並んでいます（超難解混戦レース）。")
+        
     return {
+        "mode": "castle_v6",
         "ranked_boats": rank_boats,
         "details": details,
-        "warnings": warnings,
+        "alerts": alerts,
         "va_lines": va_lines,
-        "va_odds": va_odds,
+        "va_odds": [odds_dict.get(c, 0.0) for c in va_lines],
         "vb_lines": vb_lines,
-        "vb_odds": vb_odds,
+        "vb_odds": [odds_dict.get(c, 0.0) for c in vb_lines],
+        "suji_lines": suji_lines,
+        "suji_odds": [odds_dict.get(c, 0.0) for c in suji_lines],
+        "suji_expl": suji_expl,
         "parsed_racers": bool(racers_map),
         "total_odds_count": len(odds_dict)
     }
@@ -258,63 +266,73 @@ def calculate_score_prediction(jcd: str, rno: int, date_str: str):
     
     racers_map = parse_racelist_info(racelist_soup)
     before_info = parse_beforeinfo_details(before_soup)
-    times_map = before_info.get("ex_times", {})
     odds_dict = parse_odds3t(odds_soup) if parse_odds3t else {}
     
-    base_scores = {1: 100.0, 2: 75.0, 3: 60.0, 4: 50.0, 5: 40.0, 6: 30.0}
-    time_bonuses = {i: 0.0 for i in range(1, 7)}
-    if len(times_map) == 6:
-        sorted_times = sorted(times_map.items(), key=lambda x: x[1])
-        time_bonuses[sorted_times[0][0]] = 20.0
-        time_bonuses[sorted_times[1][0]] = 10.0
-        time_bonuses[sorted_times[2][0]] = 5.0
-
+    c_pts = CASTLE_COURSE_POINTS.get(jcd, CASTLE_COURSE_POINTS["01"])
+    
     scores = {}
     details = {}
     
     for boat_no in range(1, 7):
-        b_score = base_scores[boat_no]
-        t_bonus = time_bonuses[boat_no]
+        p1 = c_pts.get(boat_no, 5.0)
         toban = racers_map.get(boat_no)
-        
-        fan_bonus = 0.0
-        fan_detail = "登番検出なし"
+        p2, p3, p4, p5, p6 = 3.0, 3.0, 3.0, 3.0, 0.0
         
         if toban and fan_loader:
-            fan_bonus, fan_detail = fan_loader.calculate_score_bonus(toban, boat_no)
-            
-        total_score = b_score + t_bonus + fan_bonus
-        scores[boat_no] = total_score
+            racer = fan_loader.get_racer(toban)
+            if racer:
+                c_fukushou = racer["courses"].get(boat_no, {}).get("fukushouritsu", 30.0)
+                if c_fukushou >= 50.0: p2 = 5.0
+                elif c_fukushou >= 35.0: p2 = 4.0
+                elif c_fukushou >= 20.0: p2 = 3.0
+                else: p2 = 2.0
+                
+                st_val = racer["courses"].get(boat_no, {}).get("avg_st", 0.17)
+                if st_val <= 0.13: p3 = 5.0
+                elif st_val <= 0.16: p3 = 4.0
+                elif st_val <= 0.19: p3 = 3.0
+                else: p3 = 2.0
+                
+                sr = racer.get("shouritsu", 5.0)
+                if sr >= 6.5: p5 = 5.0
+                elif sr >= 5.5: p5 = 4.0
+                elif sr >= 4.5: p5 = 3.0
+                else: p5 = 2.0
+                
+        total_p = p1 + p2 + p3 + p4 + p5 + p6
+        scores[boat_no] = total_p
         
-        ex_time_str = f"{times_map[boat_no]:.2f}s" if boat_no in times_map else "データなし"
-        toban_str = toban if toban else "未検出"
         details[boat_no] = {
-            "toban": toban_str,
-            "base_score": b_score,
-            "fan_bonus": fan_bonus,
-            "fan_detail": fan_detail,
-            "ex_time": ex_time_str,
-            "time_bonus": t_bonus,
-            "total_score": total_score
+            "toban": toban if toban else "未検出",
+            "p1": p1, "p2": p2, "p3": p3, "p4": p4, "p5": p5, "p6": p6,
+            "total": total_p
         }
         
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     rank_boats = [b for b, s in ranked]
     r1, r2, r3, r4, r5, r6 = rank_boats
     
-    honmei = [f"{r1}-{r2}-{r3}", f"{r1}-{r2}-{r4}", f"{r1}-{r3}-{r2}", f"{r1}-{r3}-{r4}"]
-    taikou = [f"{r2}-{r1}-{r3}", f"{r2}-{r1}-{r4}", f"{r2}-{r3}-{r1}", f"{r2}-{r3}-{r4}"]
-    oana   = [f"{r3}-{r1}-{r2}", f"{r3}-{r1}-{r4}", f"{r4}-{r1}-{r2}", f"{r4}-{r1}-{r3}"]
+    honmei_lines = [f"{r1}-{r2}-{r3}", f"{r1}-{r2}-{r4}", f"{r1}-{r3}-{r2}", f"{r1}-{r3}-{r4}"]
+    taikou_lines = [f"{r2}-{r1}-{r3}", f"{r2}-{r1}-{r4}", f"{r2}-{r3}-{r1}", f"{r2}-{r3}-{r4}"]
+    oana_lines = [f"{r3}-{r1}-{r2}", f"{r3}-{r2}-{r1}", f"{r4}-{r1}-{r2}", f"{r4}-{r2}-{r1}"]
     
-    honmei_odds = [odds_dict.get(combo, 0.0) for combo in honmei]
+    suji_lines, suji_expl = generate_suji_recommendations(r1, r2, r3, r4, r5, r6, jcd, rno) if generate_suji_recommendations else ([], [])
+    alerts = generate_venue_and_maxim_alerts(jcd, rno, racers_map, before_info, fan_loader, rank_boats) if generate_venue_and_maxim_alerts else []
     
     return {
+        "mode": "predict",
         "ranked_boats": rank_boats,
         "details": details,
-        "honmei": honmei,
-        "honmei_odds": honmei_odds,
-        "taikou": taikou,
-        "oana": oana,
+        "alerts": alerts,
+        "honmei_lines": honmei_lines,
+        "honmei_odds": [odds_dict.get(c, 0.0) for c in honmei_lines],
+        "taikou_lines": taikou_lines,
+        "taikou_odds": [odds_dict.get(c, 0.0) for c in taikou_lines],
+        "oana_lines": oana_lines,
+        "oana_odds": [odds_dict.get(c, 0.0) for c in oana_lines],
+        "suji_lines": suji_lines,
+        "suji_odds": [odds_dict.get(c, 0.0) for c in suji_lines],
+        "suji_expl": suji_expl,
         "parsed_racers": bool(racers_map),
         "total_odds_count": len(odds_dict)
     }
@@ -345,16 +363,17 @@ def parse_and_display_tables(soup, title_label: str):
         st.error(f"{title_label}: データ解析中にエラーが発生しました: {e}")
 
 # Streamlit 画面構成
-st.set_page_config(page_title="KyoteiYoso - 競艇予想システム", layout="wide")
-st.title("🚤 KyoteiYoso 競艇スクレイピング＆予想システム")
+st.set_page_config(page_title="KyoteiYoso v10 - 競艇予想＆格言スジ買いシステム", layout="wide")
+st.title("🚤 KyoteiYoso 競艇スクレイピング＆予想・格言スジ買いシステム")
+st.caption("✨ 格言集スジ買い法則 ＆ 競艇場ローカルルール ＆ 番組マンのクセ解析 完全統合版")
 
-col1, col2, col3, col4, col5 = st.columns([2, 2, 2, 3, 2])
+st.write("条件を入力して「データを取得」ボタンを押してください。データ取得後も予算金額はリアルタイムで自由に変更可能です。")
+
+# 5列構成のトップフォーム（⑤資金配分予算の事前設定）
+col1, col2, col3, col4, col5 = st.columns(5)
 
 with col1:
-    selected_date = st.date_input(
-        "① 年月日を選択",
-        value=datetime.date(2026, 10, 11)
-    )
+    selected_date = st.date_input("① 年月日を選択", value=datetime.date(2026, 10, 13))
     date_str = selected_date.strftime("%Y%m%d")
 
 with col2:
@@ -364,7 +383,6 @@ with col2:
         if code == DEFAULT_STADIUM_CODE:
             default_index = idx
             break
-            
     selected_stadium = st.selectbox("② 競艇場を選択", stadium_options, index=default_index)
     jcd_code = selected_stadium.split(" : ")[0]
 
@@ -378,76 +396,115 @@ with col4:
     selected_info_type = PAGE_TYPES[selected_info_label]
 
 with col5:
-    total_budget = st.number_input("⑤ 資金配分予算（円）", min_value=1000, max_value=1000000, value=10000, step=1000)
-
-if "cached_data" not in st.session_state:
-    st.session_state["cached_data"] = None
-if "cached_params" not in st.session_state:
-    st.session_state["cached_params"] = None
+    total_budget = st.number_input("⑤ 資金配分予算（円）", min_value=1000, max_value=500000, value=10000, step=1000)
 
 if st.button("データを取得", type="primary"):
+    date_display = selected_date.strftime('%Y/%m/%d')
+    st.session_state['fetch_params'] = {
+        "date_display": date_display,
+        "stadium_name": STADIUMS[jcd_code],
+        "jcd_code": jcd_code,
+        "rno": rno,
+        "info_label": selected_info_label,
+        "info_type": selected_info_type,
+        "date_str": date_str
+    }
+    
     with st.spinner("データを処理・取得中..."):
         if selected_info_type == "castle_v6":
-            res = calculate_castle_v6_prediction(jcd_code, rno, date_str)
-            st.session_state["cached_data"] = res
-            st.session_state["cached_params"] = (jcd_code, rno, date_str, selected_info_type, selected_info_label)
+            st.session_state['race_result'] = calculate_castle_v6_prediction(jcd_code, rno, date_str)
         elif selected_info_type == "predict":
-            res = calculate_score_prediction(jcd_code, rno, date_str)
-            st.session_state["cached_data"] = res
-            st.session_state["cached_params"] = (jcd_code, rno, date_str, selected_info_type, selected_info_label)
+            st.session_state['race_result'] = calculate_score_prediction(jcd_code, rno, date_str)
         elif selected_info_type == "all":
-            tab_soups = {
-                "castle": calculate_castle_v6_prediction(jcd_code, rno, date_str),
-                "racelist": fetch_boatrace_data("racelist", jcd_code, rno, date_str),
-                "odds3t": fetch_boatrace_data("odds3t", jcd_code, rno, date_str),
-                "beforeinfo": fetch_boatrace_data("beforeinfo", jcd_code, rno, date_str),
-                "raceresult": fetch_boatrace_data("raceresult", jcd_code, rno, date_str)
-            }
-            st.session_state["cached_data"] = tab_soups
-            st.session_state["cached_params"] = (jcd_code, rno, date_str, selected_info_type, selected_info_label)
+            st.session_state['race_result'] = {"mode": "all"}
         else:
             soup = fetch_boatrace_data(selected_info_type, jcd_code, rno, date_str)
-            st.session_state["cached_data"] = soup
-            st.session_state["cached_params"] = (jcd_code, rno, date_str, selected_info_type, selected_info_label)
+            st.session_state['race_result'] = {"mode": "single_table", "soup": soup}
 
-if st.session_state.get("cached_data") is not None:
-    c_jcd, c_rno, c_date_str, c_type, c_label = st.session_state["cached_params"]
-    date_display = f"{c_date_str[:4]}/{c_date_str[4:6]}/{c_date_str[6:]}"
+# 結果のレンダリング（セッション状態から読み出し）
+if 'fetch_params' in st.session_state and 'race_result' in st.session_state:
     st.markdown("---")
-    st.write(f"【表示中データ】 日付: **{date_display}** | 競艇場: **{STADIUMS.get(c_jcd, c_jcd)} ({c_jcd})** | レース: **{c_rno}R** | モード: **{c_label}**")
+    fp = st.session_state['fetch_params']
+    res = st.session_state['race_result']
     
-    res = st.session_state["cached_data"]
+    st.write(f"【検索条件】 日付: **{fp['date_display']}** | 競艇場: **{fp['stadium_name']} ({fp['jcd_code']})** | レース: **{fp['rno']}R** | モード: **{fp['info_label']}**")
     
-    if c_type == "castle_v6":
-        st.subheader("🏰 【キャッスル式V6作戦】 予想＆オッズ資金分配")
-        st.caption(f"オッズ解析状態: 取得総件数 {res.get('total_odds_count', 0)} / 120点")
-        
-        if res.get("warnings"):
-            for w in res["warnings"]:
-                st.warning(w)
-                
-        col_va, col_vb = st.columns(2)
-        with col_va:
-            st.success("■ VA線（本命ライン・6点）")
-            for c, o in zip(res["va_lines"], res["va_odds"]):
-                o_str = f"{o:.1f}倍" if o > 0 else "--- 倍"
-                st.write(f"👉 **{c}** (オッズ: **{o_str}**)")
-                
-        with col_vb:
-            st.info("■ VB線（穴目ライン・4点）")
-            for c, o in zip(res["vb_lines"], res["vb_odds"]):
-                o_str = f"{o:.1f}倍" if o > 0 else "--- 倍"
-                st.write(f"👉 **{c}** (オッズ: **{o_str}**)")
-                
+    mode = res.get("mode")
+    
+    if mode in ["castle_v6", "predict"]:
+        # 1. 競艇格言・場別ローカルルール・番組マン注意アラート
+        alerts = res.get("alerts", [])
+        if alerts:
+            st.subheader("💡 競艇格言・場別ローカルルール・番組マン注意アラート")
+            for a in alerts:
+                if "⚠️" in a:
+                    st.warning(a)
+                else:
+                    st.info(a)
+                    
+        # 2. 予想買い目表示
+        if mode == "castle_v6":
+            st.subheader("🏰 【キャッスル式V6作戦】 予想買い目")
+            col_va, col_vb = st.columns(2)
+            with col_va:
+                st.success("■ VA線（本命ライン・6点）")
+                for c, o in zip(res["va_lines"], res["va_odds"]):
+                    o_str = f"{o:.1f}倍" if o > 0 else "--- 倍"
+                    st.write(f"👉 **{c}** (オッズ: **{o_str}**)")
+            with col_vb:
+                st.info("■ VB線（穴目ライン・4点）")
+                for c, o in zip(res["vb_lines"], res["vb_odds"]):
+                    o_str = f"{o:.1f}倍" if o > 0 else "--- 倍"
+                    st.write(f"👉 **{c}** (オッズ: **{o_str}**)")
+            target_odds = res["va_odds"]
+            target_lines = res["va_lines"]
+            
+        else: # predict
+            st.subheader("🎯 【スコア買い目予想】 本命・対抗・大穴")
+            col1_p, col2_p, col3_p = st.columns(3)
+            with col1_p:
+                st.success("■ 本命買い目（4点）")
+                for c, o in zip(res["honmei_lines"], res["honmei_odds"]):
+                    o_str = f"{o:.1f}倍" if o > 0 else "--- 倍"
+                    st.write(f"👉 **{c}** ({o_str})")
+            with col2_p:
+                st.info("■ 対抗買い目（4点）")
+                for c, o in zip(res["taikou_lines"], res["taikou_odds"]):
+                    o_str = f"{o:.1f}倍" if o > 0 else "--- 倍"
+                    st.write(f"👉 **{c}** ({o_str})")
+            with col3_p:
+                st.warning("■ 大穴買い目（4点）")
+                for c, o in zip(res["oana_lines"], res["oana_odds"]):
+                    o_str = f"{o:.1f}倍" if o > 0 else "--- 倍"
+                    st.write(f"👉 **{c}** ({o_str})")
+            target_odds = res["honmei_odds"]
+            target_lines = res["honmei_lines"]
+
+        # 3. 格言集スジ買い法則に基づく推奨目
+        suji_lines = res.get("suji_lines", [])
+        suji_odds = res.get("suji_odds", [])
+        suji_expl = res.get("suji_expl", [])
+        if suji_lines:
+            st.markdown("---")
+            st.subheader("📜 【格言集スジ買い法則】 展開スジ買い推奨目")
+            if suji_expl:
+                for exp in suji_expl:
+                    st.caption(f"・{exp}")
+            cols_s = st.columns(min(len(suji_lines), 6))
+            for idx_s, (c, o) in enumerate(zip(suji_lines, suji_odds)):
+                with cols_s[idx_s % len(cols_s)]:
+                    o_str = f"{o:.1f}倍" if o > 0 else "---"
+                    st.metric(label=f"スジ買い {c}", value=o_str)
+
+        # 4. 資金分配表（最上部の設定金額に即時連動）
         st.markdown("---")
-        st.subheader("💰 資金分配（払戻均等化計算）")
-        
-        if calculate_capital_allocation and res.get("va_odds"):
-            alloc_res = calculate_capital_allocation(res["va_odds"], total_budget=total_budget)
-            st.write(f"📊 **VA線 合成オッズ**: **{alloc_res['synthetic_odds']:.2f}倍** | **目標払戻額**: **約 {int(alloc_res['target_payout']):,} 円** (設定予算: **{total_budget:,} 円**)")
+        st.subheader(f"💰 傾斜資金分配（設定予算: {total_budget:,} 円）")
+        if calculate_capital_allocation and target_odds:
+            alloc_res = calculate_capital_allocation(target_odds, total_budget=total_budget)
+            st.write(f"📊 **合成オッズ**: **{alloc_res['synthetic_odds']:.2f}倍** | **目標払戻額**: **約 {int(alloc_res['target_payout']):,} 円**")
             
             table_alloc = []
-            for combo, o, a in zip(res["va_lines"], res["va_odds"], alloc_res["allocations"]):
+            for combo, o, a in zip(target_lines, target_odds, alloc_res["allocations"]):
                 table_alloc.append({
                     "買い目": combo,
                     "現在オッズ": f"{o:.1f}倍" if o > 0 else "---",
@@ -456,10 +513,10 @@ if st.session_state.get("cached_data") is not None:
                     "回収率": f"{a['return_rate']:.1f}%"
                 })
             st.dataframe(pd.DataFrame(table_alloc), use_container_width=True)
-            
+
+        # 5. 艇別評価明細表
         st.markdown("---")
-        st.subheader("📊 キャッスルV6 6大要素採点明細")
-        
+        st.subheader("📊 艇別評価 6大要素採点明細")
         table_score = []
         symbols = ["◎ (1位)", "○ (2位)", "▲ (3位)", "△ (4位)", "☆ (5位)", "消 (6位)"]
         for rank_idx, b_no in enumerate(res["ranked_boats"]):
@@ -477,107 +534,47 @@ if st.session_state.get("cached_data") is not None:
                 "⑥体重補正": f"{d['p6']:.1f}"
             })
         st.dataframe(pd.DataFrame(table_score), use_container_width=True)
-        
-    elif c_type == "predict":
-        st.subheader("🎯 【データ＆理論】3連単買い目予想")
-        st.caption(f"オッズ解析状態: 取得総件数 {res.get('total_odds_count', 0)} / 120点")
-        
-        col_a, col_b, col_c = st.columns(3)
-        with col_a:
-            st.success("■ 本命（堅調・4点）")
-            for item, o in zip(res["honmei"], res["honmei_odds"]):
-                o_str = f"({o:.1f}倍)" if o > 0 else "(---)"
-                st.write(f"👉 **{item}** {o_str}")
-        with col_b:
-            st.info("■ 対抗・抑え（4点）")
-            for item in res["taikou"]:
-                st.write(f"👉 **{item}**")
-        with col_c:
-            st.warning("■ 大穴・高配当（4点）")
-            for item in res["oana"]:
-                st.write(f"👉 **{item}**")
-                
-        st.markdown("---")
-        st.subheader("💰 本命買い目 資金分配（払戻均等化計算）")
-        
-        if calculate_capital_allocation and res.get("honmei_odds"):
-            alloc_res = calculate_capital_allocation(res["honmei_odds"], total_budget=total_budget)
-            st.write(f"📊 **本命合成オッズ**: **{alloc_res['synthetic_odds']:.2f}倍** | **目標払戻額**: **約 {int(alloc_res['target_payout']):,} 円** (設定予算: **{total_budget:,} 円**)")
-            
-            table_alloc = []
-            for combo, o, a in zip(res["honmei"], res["honmei_odds"], alloc_res["allocations"]):
-                table_alloc.append({
-                    "買い目": combo,
-                    "現在オッズ": f"{o:.1f}倍" if o > 0 else "---",
-                    "推奨購入金額": f"{a['stake']:,} 円",
-                    "的中時払戻金": f"{int(a['expected_payout']):,} 円",
-                    "回収率": f"{a['return_rate']:.1f}%"
-                })
-            st.dataframe(pd.DataFrame(table_alloc), use_container_width=True)
-            
-        st.markdown("---")
-        st.subheader("📊 6艇別 予想評価スコア明細")
-        
-        table_data = []
-        symbols = ["◎ (軸)", "○ (対抗)", "▲ (単穴)", "△ (連下)", "☆ (注意)", "消"]
-        for rank_idx, b_no in enumerate(res["ranked_boats"]):
-            d = res["details"][b_no]
-            table_data.append({
-                "評価": symbols[rank_idx],
-                "艇番": f"{b_no}号艇",
-                "登番": d["toban"],
-                "総合スコア": f"{d['total_score']:.1f} pts",
-                "枠番基礎点": f"{d['base_score']:.1f}",
-                "ファン手帳加点": f"+{d['fan_bonus']:.1f}",
-                "ファン手帳詳細": d["fan_detail"],
-                "展示タイム": d["ex_time"],
-                "展示加点": f"+{d['time_bonus']:.1f}"
-            })
-        st.dataframe(pd.DataFrame(table_data), use_container_width=True)
-        
-        if not res["parsed_racers"]:
-            st.info("💡 出走表から登番が検出できなかったため、枠番ベース点中心の評価となっています（未開催またはWebページ形式変更の可能性）。")
 
-    elif c_type == "all":
+    elif mode == "all":
         tab0, tab1, tab2, tab3, tab4 = st.tabs(["🏰 キャッスルV6予想", "出走表（番組）", "オッズ（3連単）", "直前情報", "レース結果"])
+        jcd = fp['jcd_code']
+        rno_val = fp['rno']
+        d_str = fp['date_str']
         
         with tab0:
-            c_res = res["castle"]
+            res_v6 = calculate_castle_v6_prediction(jcd, rno_val, d_str)
             st.subheader("🏰【キャッスル式V6作戦】 予想＆オッズ")
+            alerts = res_v6.get("alerts", [])
+            if alerts:
+                for a in alerts:
+                    st.info(a)
             col_va, col_vb = st.columns(2)
             with col_va:
                 st.success("■ VA線（本命・6点）")
-                for c, o in zip(c_res["va_lines"], c_res["va_odds"]):
+                for c, o in zip(res_v6["va_lines"], res_v6["va_odds"]):
                     o_str = f"{o:.1f}倍" if o > 0 else "---"
                     st.write(f"👉 **{c}** ({o_str})")
             with col_vb:
                 st.info("■ VB線（穴目・4点）")
-                for c, o in zip(c_res["vb_lines"], c_res["vb_odds"]):
+                for c, o in zip(res_v6["vb_lines"], res_v6["vb_odds"]):
                     o_str = f"{o:.1f}倍" if o > 0 else "---"
                     st.write(f"👉 **{c}** ({o_str})")
-                    
-            if calculate_capital_allocation and c_res.get("va_odds"):
-                alloc_res = calculate_capital_allocation(c_res["va_odds"], total_budget=total_budget)
-                st.write(f"📊 **VA線 合成オッズ**: **{alloc_res['synthetic_odds']:.2f}倍** | **目標払戻額**: **約 {int(alloc_res['target_payout']):,} 円** (設定予算: **{total_budget:,} 円**)")
-                table_alloc = []
-                for combo, o, a in zip(c_res["va_lines"], c_res["va_odds"], alloc_res["allocations"]):
-                    table_alloc.append({
-                        "買い目": combo,
-                        "現在オッズ": f"{o:.1f}倍" if o > 0 else "---",
-                        "推奨購入金額": f"{a['stake']:,} 円",
-                        "的中時払戻金": f"{int(a['expected_payout']):,} 円",
-                        "回収率": f"{a['return_rate']:.1f}%"
-                    })
-                st.dataframe(pd.DataFrame(table_alloc), use_container_width=True)
         
         with tab1:
-            parse_and_display_tables(res["racelist"], "出走表")
+            soup = fetch_boatrace_data("racelist", jcd, rno_val, d_str)
+            parse_and_display_tables(soup, "出走表")
+        
         with tab2:
-            parse_and_display_tables(res["odds3t"], "オッズ")
+            soup = fetch_boatrace_data("odds3t", jcd, rno_val, d_str)
+            parse_and_display_tables(soup, "オッズ")
+        
         with tab3:
-            parse_and_display_tables(res["beforeinfo"], "直前情報")
+            soup = fetch_boatrace_data("beforeinfo", jcd, rno_val, d_str)
+            parse_and_display_tables(soup, "直前情報")
+        
         with tab4:
-            parse_and_display_tables(res["raceresult"], "レース結果")
-            
-    else:
-        parse_and_display_tables(res, c_label)
+            soup = fetch_boatrace_data("raceresult", jcd, rno_val, d_str)
+            parse_and_display_tables(soup, "レース結果")
+
+    elif mode == "single_table":
+        parse_and_display_tables(res.get("soup"), fp['info_label'])

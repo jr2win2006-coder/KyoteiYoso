@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=KyoteiYoso
+Comment=競艇スクレイピング＆予想・スジ買いアプリ
+Exec=bash -i -c "cd \"$HOME/ダウンロード/競艇スクレイピング\" && ./KyoteiYoso.sh; echo ''; echo '処理が終了・停止しました。キーを押すとウィンドウを閉じます...'; read"
+Icon=utilities-terminal
+Terminal=true
+Categories=Application;
