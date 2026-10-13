@@ -264,7 +264,7 @@ def calculate_capital_allocation(odds_list, total_budget=10000):
     }
 
 
-def generate_suji_recommendations(r1, r2, r3, r4, r5, r6, jcd, rno):
+def generate_suji_recommendations(r1, r2, r3, r4, r5, r6, jcd, rno, suji_outer_ext=True):
     """
     格言集のスジ買い法則および番組マンのクセに基づくスジ買いの買い目生成
     - まくり（3,4コース頭）➔ 内外スジ (4-5, 4-6, 4-1 / 3-4, 3-5, 3-1)
@@ -295,13 +295,22 @@ def generate_suji_recommendations(r1, r2, r3, r4, r5, r6, jcd, rno):
 
     # 3. 軸が3号艇の場合（まくり・まくり差し）
     elif r1 == 3:
-        suji_lines.extend([f"3-1-{r2}", f"3-1-{r4}", f"3-4-{r1}", f"3-5-{r1}"])
-        explanations.append("【格言：まくりは内外 / まくり差しは総合力】3コース攻めによる内外連動＆3-1スジ")
+        if suji_outer_ext:
+            suji_lines.extend([f"3-1-{r2}", f"3-1-{r4}", f"3-4-{r1}", f"3-4-{r5}", f"3-5-{r1}", f"3-5-{r4}"])
+            explanations.append("【格言：まくりは内外（外枠連動拡張）】3コース攻めによる4・5号艇連動スジ")
+        else:
+            suji_lines.extend([f"3-1-{r2}", f"3-1-{r4}", f"3-4-{r1}", f"3-5-{r1}"])
+            explanations.append("【格言：まくりは内外 / まくり差しは総合力】3コース攻めによる内外連動＆3-1スジ")
 
     # 4. 軸が4号艇の場合（カドまくり）
     elif r1 == 4:
-        suji_lines.extend([f"4-5-{r1}", f"4-5-{r6}", f"4-6-{r1}", f"4-1-{r5}"])
-        explanations.append("【格言：まくりは内外（カドまくりスジ）】4コースまくりで内失速、外枠5・6号艇が連動")
+        if suji_outer_ext:
+            suji_lines.extend([f"4-5-{r1}", f"4-5-{r6}", f"4-5-{r2}", f"4-6-{r1}", f"4-6-{r5}", f"4-1-{r5}"])
+            explanations.append("【格言：まくりは内外（外枠5・6号艇連動拡張スジ）】カドまくり展開で内沈没・外枠総崩れ追従")
+        else:
+            suji_lines.extend([f"4-5-{r1}", f"4-5-{r6}", f"4-6-{r1}", f"4-1-{r5}"])
+            explanations.append("【格言：まくりは内外（カドまくりスジ）】4コースまくりで内失速、外枠5・6号艇が連動")
+            
         if jcd == "04":  # 平和島
             suji_lines.extend(["5-1-2", "5-2-1"])
             explanations.append("【平和島格言：来そうな選手の一つ外は返しておけ】4まくり抵抗時の5コース差し抜け高配当")
@@ -309,12 +318,14 @@ def generate_suji_recommendations(r1, r2, r3, r4, r5, r6, jcd, rno):
     # 5. 5・6号艇軸の場合
     else:
         suji_lines.extend([f"{r1}-1-{r2}", f"{r1}-4-{r2}", f"{r1}-{r2}-1"])
+        if suji_outer_ext:
+            suji_lines.append(f"{r1}-5-{r6}" if r1 == 4 else f"{r1}-6-{r5}")
         explanations.append("【展開波乱・大穴スジ】アウトコースまくり差し・差し抜けの波乱決着")
         
     return list(dict.fromkeys(suji_lines)), explanations
 
 
-def generate_venue_and_maxim_alerts(jcd: str, rno: int, racers_map: dict, before_info: dict, fan_loader, ranked_boats: list):
+def generate_venue_and_maxim_alerts(jcd: str, rno: int, racers_map: dict, before_info: dict, fan_loader, ranked_boats: list, hidden_a_bonus=5.0):
     """
     格言集および番組マンのクセに基づくリアルタイム注意・アラート生成
     """
@@ -359,7 +370,7 @@ def generate_venue_and_maxim_alerts(jcd: str, rno: int, racers_map: dict, before
                     if is_hidden:
                         hidden_a_list.append(f"{b_no}号艇:{h_desc}")
     if hidden_a_list:
-        alerts.append(f"👤 【中穴マンの刺客：隠れA級検出】" + ", ".join(hidden_a_list) + " ➔ 記号的B級だが本番の捌き・気合で波乱を起こす要注意艇！")
+        alerts.append(f"👤 【中穴マンの刺客：隠れA級検出 (+{hidden_a_bonus:.1f}pt加算)】" + ", ".join(hidden_a_list) + " ➔ 記号的B級だが本番の捌き・気合で波乱を起こす要注意艇！")
 
     # 4. チルト跳ね上げアラート
     for b_no, tilt_val in before_info.get("tilts", {}).items():
