@@ -104,8 +104,16 @@ PAGE_TYPES = {
     "【一括取得】すべての情報": "all"
 }
 
-def fetch_boatrace_data(page_type: str, jcd: str, rno: int, date_str: str):
-    domain = "www" + "." + "boatrace" + "." + "jp"
+# ==========================================
+# 【スマートキャッシュ付き データ取得関数】
+# ==========================================
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_boatrace_html(page_type: str, jcd: str, rno: int, date_str: str) -> str:
+    """
+    boatrace.jpからHTML文字列を取得し、30分間メモリキャッシュする関数
+    同じレース情報であれば相手サーバーへアクセスせずキャッシュから即返却します
+    """
+    domain = "www.boatrace.jp"
     base_url = f"https://{domain}/owpc/pc/race/{page_type}"
     params = {"rno": rno, "jcd": jcd, "hd": date_str}
     headers = {
@@ -120,14 +128,24 @@ def fetch_boatrace_data(page_type: str, jcd: str, rno: int, date_str: str):
             response = requests.get(base_url, params=params, headers=headers, timeout=timeout_config)
             response.raise_for_status()
             response.encoding = response.apparent_encoding
-            return BeautifulSoup(response.text, "html.parser")
-        except requests.exceptions.RequestException as e:
+            return response.text
+        except requests.exceptions.RequestException:
             if attempt == 0:
                 time.sleep(1.5)
                 continue
             else:
-                st.error(f"通信エラーが発生しました ({page_type}): {e}")
-                return None
+                return ""
+
+def fetch_boatrace_data(page_type: str, jcd: str, rno: int, date_str: str):
+    """
+    キャッシュされたHTML文字列をBeautifulSoupオブジェクトに変換して返却
+    """
+    html_text = fetch_boatrace_html(page_type, jcd, rno, date_str)
+    if html_text:
+        return BeautifulSoup(html_text, "html.parser")
+    else:
+        st.error(f"通信エラーが発生しました ({page_type})")
+        return None
 
 def parse_racelist_info(soup):
     racers = {}
@@ -186,13 +204,7 @@ def parse_beforeinfo_details(soup):
 
 def calculate_castle_v6_prediction(jcd: str, rno: int, date_str: str, params: dict = None):
     if params is None:
-        params = {
-            "ex_top_bonus": 15.0,
-            "in_weak_winrate": 4.5,
-            "in_weak_penalty": -3.0,
-            "hidden_a_bonus": 5.0,
-            "suji_outer_ext": True
-        }
+        params = {"ex_top_bonus": 15.0, "in_weak_winrate": 4.5, "in_weak_penalty": -3.0, "hidden_a_bonus": 5.0, "suji_outer_ext": True}
         
     racelist_soup = fetch_boatrace_data("racelist", jcd, rno, date_str)
     before_soup = fetch_boatrace_data("beforeinfo", jcd, rno, date_str)
@@ -207,11 +219,30 @@ def calculate_castle_v6_prediction(jcd: str, rno: int, date_str: str, params: di
     scores = {}
     details = {}
     
+    # パラメータ抽出
+    ex_top_bonus = params.get("ex_top_bonus", 15.0)
+    in_weak_winrate = params.get("in_weak_winrate", 4.5)
+    in_weak_penalty = params.get("in_weak_penalty", -3.0)
+    hidden_a_bonus = params.get("hidden_a_bonus", 5.0)
+    
+    # 展示タイム解析
+    ex_times = before_info.get("ex_times", {})
+    valid_ex = {b: t for b, t in ex_times.items() if t > 0}
+    ex_top_boat = min(valid_ex, key=valid_ex.get) if valid_ex else None
+    
     for boat_no in range(1, 7):
         p1 = c_pts.get(boat_no, 5.0)
         toban = racers_map.get(boat_no)
         p2, p3, p4, p5, p6 = 3.0, 3.0, 3.0, 3.0, 0.0
         
+        p_ex = 0.0
+        p_in_pen = 0.0
+        p_hidden = 0.0
+        
+        # 展示最速艇ボーナス
+        if ex_top_boat and boat_no == ex_top_boat:
+            p_ex = ex_top_bonus
+            
         if toban and fan_loader:
             racer = fan_loader.get_racer(toban)
             if racer:
@@ -233,23 +264,25 @@ def calculate_castle_v6_prediction(jcd: str, rno: int, date_str: str, params: di
                 elif sr >= 4.5: p5 = 3.0
                 else: p5 = 2.0
                 
-                # パラメータ調整: 1号艇イン飛び波乱減点
-                if boat_no == 1 and sr < params.get("in_weak_winrate", 4.5):
-                    p6 += params.get("in_weak_penalty", -3.0)
-                
-                # パラメータ調整: 隠れA級加点
+                # イン飛び減点判定 (1号艇)
+                if boat_no == 1:
+                    if sr < in_weak_winrate:
+                        p_in_pen = in_weak_penalty
+                        
+                # 隠れA級判定
                 kyu = racer.get("kyu", "B1")
                 if detect_hidden_a and boat_no in [2, 3, 4]:
                     is_h, _ = detect_hidden_a(toban, kyu, sr)
                     if is_h:
-                        p6 += params.get("hidden_a_bonus", 5.0)
+                        p_hidden = hidden_a_bonus
                 
-        total_p = p1 + p2 + p3 + p4 + p5 + p6
+        total_p = p1 + p2 + p3 + p4 + p5 + p6 + p_ex + p_in_pen + p_hidden
         scores[boat_no] = total_p
         
         details[boat_no] = {
             "toban": toban if toban else "未検出",
             "p1": p1, "p2": p2, "p3": p3, "p4": p4, "p5": p5, "p6": p6,
+            "p_ex": p_ex, "p_in_pen": p_in_pen, "p_hidden": p_hidden,
             "total": total_p
         }
         
@@ -260,13 +293,8 @@ def calculate_castle_v6_prediction(jcd: str, rno: int, date_str: str, params: di
     va_lines = [f"{r1}-{r2}-{r3}", f"{r1}-{r2}-{r4}", f"{r1}-{r2}-{r5}", f"{r1}-{r2}-{r6}", f"{r1}-{r3}-{r2}", f"{r1}-{r3}-{r4}"]
     vb_lines = [f"{r2}-{r1}-{r3}", f"{r2}-{r1}-{r4}", f"{r2}-{r3}-{r1}", f"{r2}-{r3}-{r4}"]
     
-    suji_lines, suji_expl = generate_suji_recommendations(
-        r1, r2, r3, r4, r5, r6, jcd, rno, suji_outer_ext=params.get("suji_outer_ext", True)
-    ) if generate_suji_recommendations else ([], [])
-    
-    alerts = generate_venue_and_maxim_alerts(
-        jcd, rno, racers_map, before_info, fan_loader, rank_boats, hidden_a_bonus=params.get("hidden_a_bonus", 5.0)
-    ) if generate_venue_and_maxim_alerts else []
+    suji_lines, suji_expl = generate_suji_recommendations(r1, r2, r3, r4, r5, r6, jcd, rno, suji_outer_ext=params.get("suji_outer_ext", True)) if generate_suji_recommendations else ([], [])
+    alerts = generate_venue_and_maxim_alerts(jcd, rno, racers_map, before_info, fan_loader, rank_boats) if generate_venue_and_maxim_alerts else []
     
     top3_scores = [s for b, s in ranked[:3]]
     if len(top3_scores) >= 3 and (top3_scores[0] == top3_scores[1] == top3_scores[2]):
@@ -290,14 +318,8 @@ def calculate_castle_v6_prediction(jcd: str, rno: int, date_str: str, params: di
 
 def calculate_score_prediction(jcd: str, rno: int, date_str: str, params: dict = None):
     if params is None:
-        params = {
-            "ex_top_bonus": 15.0,
-            "in_weak_winrate": 4.5,
-            "in_weak_penalty": -3.0,
-            "hidden_a_bonus": 5.0,
-            "suji_outer_ext": True
-        }
-        
+        params = {"ex_top_bonus": 15.0, "in_weak_winrate": 4.5, "in_weak_penalty": -3.0, "hidden_a_bonus": 5.0, "suji_outer_ext": True}
+
     racelist_soup = fetch_boatrace_data("racelist", jcd, rno, date_str)
     before_soup = fetch_boatrace_data("beforeinfo", jcd, rno, date_str)
     odds_soup = fetch_boatrace_data("odds3t", jcd, rno, date_str)
@@ -306,57 +328,70 @@ def calculate_score_prediction(jcd: str, rno: int, date_str: str, params: dict =
     before_info = parse_beforeinfo_details(before_soup)
     odds_dict = parse_odds3t(odds_soup) if parse_odds3t else {}
     
+    c_pts = CASTLE_COURSE_POINTS.get(jcd, CASTLE_COURSE_POINTS["01"])
+    
     scores = {}
     details = {}
     
+    ex_top_bonus = params.get("ex_top_bonus", 15.0)
+    in_weak_winrate = params.get("in_weak_winrate", 4.5)
+    in_weak_penalty = params.get("in_weak_penalty", -3.0)
+    hidden_a_bonus = params.get("hidden_a_bonus", 5.0)
+
     ex_times = before_info.get("ex_times", {})
-    sorted_ex = sorted(ex_times.items(), key=lambda x: x[1]) if ex_times else []
-    ex_top_boat = sorted_ex[0][0] if sorted_ex else None
+    valid_ex = {b: t for b, t in ex_times.items() if t > 0}
+    ex_top_boat = min(valid_ex, key=valid_ex.get) if valid_ex else None
     
     for boat_no in range(1, 7):
+        p1 = c_pts.get(boat_no, 5.0)
         toban = racers_map.get(boat_no)
+        p2, p3, p4, p5, p6 = 3.0, 3.0, 3.0, 3.0, 0.0
         
-        # ① 展示タイム点（最速艇に大幅加点）
-        p1 = 0.0
-        if boat_no in ex_times:
-            if ex_top_boat == boat_no:
-                p1 = params.get("ex_top_bonus", 15.0)
-                if len(sorted_ex) >= 2 and (sorted_ex[1][1] - sorted_ex[0][1]) >= 0.03:
-                    p1 += 3.0  # 独走最速ならさらに+3pt
-            elif len(sorted_ex) >= 2 and sorted_ex[1][0] == boat_no:
-                p1 = 7.0
-            elif len(sorted_ex) >= 3 and sorted_ex[2][0] == boat_no:
-                p1 = 4.0
-                
-        # ② 能力指数・勝率点
-        p2 = 3.0
-        p3 = 0.0  # イン弱体化減点 / 隠れA級ボーナス
+        p_ex = 0.0
+        p_in_pen = 0.0
+        p_hidden = 0.0
+
+        if ex_top_boat and boat_no == ex_top_boat:
+            p_ex = ex_top_bonus
+            
         if toban and fan_loader:
             racer = fan_loader.get_racer(toban)
             if racer:
-                sr = racer.get("shouritsu", 5.0)
-                if sr >= 6.5: p2 = 8.0
-                elif sr >= 5.5: p2 = 6.0
-                elif sr >= 4.5: p2 = 4.0
+                c_fukushou = racer["courses"].get(boat_no, {}).get("fukushouritsu", 30.0)
+                if c_fukushou >= 50.0: p2 = 5.0
+                elif c_fukushou >= 35.0: p2 = 4.0
+                elif c_fukushou >= 20.0: p2 = 3.0
                 else: p2 = 2.0
                 
-                # 1号艇イン飛び減点
-                if boat_no == 1 and sr < params.get("in_weak_winrate", 4.5):
-                    p3 += params.get("in_weak_penalty", -3.0)
-                    
-                # 隠れA級ボーナス
+                st_val = racer["courses"].get(boat_no, {}).get("avg_st", 0.17)
+                if st_val <= 0.13: p3 = 5.0
+                elif st_val <= 0.16: p3 = 4.0
+                elif st_val <= 0.19: p3 = 3.0
+                else: p3 = 2.0
+                
+                sr = racer.get("shouritsu", 5.0)
+                if sr >= 6.5: p5 = 5.0
+                elif sr >= 5.5: p5 = 4.0
+                elif sr >= 4.5: p5 = 3.0
+                else: p5 = 2.0
+
+                if boat_no == 1:
+                    if sr < in_weak_winrate:
+                        p_in_pen = in_weak_penalty
+                        
                 kyu = racer.get("kyu", "B1")
                 if detect_hidden_a and boat_no in [2, 3, 4]:
                     is_h, _ = detect_hidden_a(toban, kyu, sr)
                     if is_h:
-                        p3 += params.get("hidden_a_bonus", 5.0)
-                        
-        total_p = p1 + p2 + p3
+                        p_hidden = hidden_a_bonus
+                
+        total_p = p1 + p2 + p3 + p4 + p5 + p6 + p_ex + p_in_pen + p_hidden
         scores[boat_no] = total_p
         
         details[boat_no] = {
             "toban": toban if toban else "未検出",
-            "p1": p1, "p2": p2, "p3": p3, "p4": 0.0, "p5": 0.0, "p6": 0.0,
+            "p1": p1, "p2": p2, "p3": p3, "p4": p4, "p5": p5, "p6": p6,
+            "p_ex": p_ex, "p_in_pen": p_in_pen, "p_hidden": p_hidden,
             "total": total_p
         }
         
@@ -364,25 +399,12 @@ def calculate_score_prediction(jcd: str, rno: int, date_str: str, params: dict =
     rank_boats = [b for b, s in ranked]
     r1, r2, r3, r4, r5, r6 = rank_boats
     
-    # フォーメーション生成（展示タイム最速軸・波乱軸）
-    if ex_top_boat and ex_top_boat in [2, 3, 4, 5, 6]:
-        tb = ex_top_boat
-        others = [x for x in [1, 2, 3, 4, 5, 6] if x != tb]
-        o1, o2, o3 = others[0], others[1], others[2]
-        honmei_lines = [f"{tb}-{o1}-{o2}", f"{tb}-{o1}-{o3}", f"{tb}-{o2}-{o1}", f"{tb}-{o2}-{o3}"]
-    else:
-        honmei_lines = [f"{r1}-{r2}-{r3}", f"{r1}-{r2}-{r4}", f"{r1}-{r3}-{r2}", f"{r1}-{r3}-{r4}"]
-        
-    taikou_lines = [f"{r3}-{r4}-{r1}", f"{r3}-{r4}-{r2}", f"{r3}-{r1}-{r4}", f"{r4}-{r3}-{r1}"]
-    oana_lines = [f"{r2}-{r3}-{r4}", f"{r3}-{r5}-{r6}", f"{r3}-{r6}-{r1}", f"{r5}-{r6}-{r3}"]
+    honmei_lines = [f"{r1}-{r2}-{r3}", f"{r1}-{r2}-{r4}", f"{r1}-{r3}-{r2}", f"{r1}-{r3}-{r4}"]
+    taikou_lines = [f"{r2}-{r1}-{r3}", f"{r2}-{r1}-{r4}", f"{r2}-{r3}-{r1}", f"{r2}-{r3}-{r4}"]
+    oana_lines = [f"{r3}-{r1}-{r2}", f"{r3}-{r2}-{r1}", f"{r4}-{r1}-{r2}", f"{r4}-{r2}-{r1}"]
     
-    suji_lines, suji_expl = generate_suji_recommendations(
-        r1, r2, r3, r4, r5, r6, jcd, rno, suji_outer_ext=params.get("suji_outer_ext", True)
-    ) if generate_suji_recommendations else ([], [])
-    
-    alerts = generate_venue_and_maxim_alerts(
-        jcd, rno, racers_map, before_info, fan_loader, rank_boats, hidden_a_bonus=params.get("hidden_a_bonus", 5.0)
-    ) if generate_venue_and_maxim_alerts else []
+    suji_lines, suji_expl = generate_suji_recommendations(r1, r2, r3, r4, r5, r6, jcd, rno, suji_outer_ext=params.get("suji_outer_ext", True)) if generate_suji_recommendations else ([], [])
+    alerts = generate_venue_and_maxim_alerts(jcd, rno, racers_map, before_info, fan_loader, rank_boats) if generate_venue_and_maxim_alerts else []
     
     return {
         "mode": "predict",
@@ -428,11 +450,11 @@ def parse_and_display_tables(soup, title_label: str):
         st.error(f"{title_label}: データ解析中にエラーが発生しました: {e}")
 
 # Streamlit 画面構成
-st.set_page_config(page_title="KyoteiYoso v11 - 競艇予想＆設定パラメータカスタムシステム", layout="wide")
-st.title("🚤 KyoteiYoso 競艇スクレイピング＆予想・カスタムパラメータ調整システム")
-st.caption("✨ 展示タイム加点 / イン飛び波乱判定 / 隠れA級ボーナス / 外枠スジ拡張 設定カスタム対応版")
+st.set_page_config(page_title="KyoteiYoso v10 - 競艇予想＆格言スジ買いシステム", layout="wide")
+st.title("🚤 KyoteiYoso 競艇スクレイピング＆予想・格言スジ買いシステム")
+st.caption("✨ 格言集スジ買い法則 ＆ 競艇場ローカルルール ＆ 番組マンのクセ解析 完全統合版")
 
-st.write("条件を入力して「データを取得」ボタンを押してください。設定パラメータは自由に変更・バックテスト最適化可能です。")
+st.write("条件を入力して「データを取得」ボタンを押してください。データ取得後も予算金額はリアルタイムで自由に変更可能です。")
 
 # 5列構成のトップフォーム（⑤資金配分予算の事前設定）
 col1, col2, col3, col4, col5 = st.columns(5)
@@ -504,7 +526,15 @@ params_dict = {
     "suji_outer_ext": suji_outer_ext
 }
 
-if st.button("データを取得", type="primary"):
+col_btn1, col_btn2 = st.columns([3, 1])
+with col_btn1:
+    btn_fetch = st.button("データを取得 / パラメータ適用再計算", type="primary", use_container_width=True)
+with col_btn2:
+    if st.button("🔄 キャッシュクリア", use_container_width=True):
+        st.cache_data.clear()
+        st.success("キャッシュをクリアしました！次回は最新WEBデータを取得します。")
+
+if btn_fetch:
     date_display = selected_date.strftime('%Y/%m/%d')
     st.session_state['fetch_params'] = {
         "date_display": date_display,
@@ -513,10 +543,11 @@ if st.button("データを取得", type="primary"):
         "rno": rno,
         "info_label": selected_info_label,
         "info_type": selected_info_type,
-        "date_str": date_str
+        "date_str": date_str,
+        "params": params_dict
     }
     
-    with st.spinner("データを処理・取得中..."):
+    with st.spinner("データを処理・計算中..."):
         if selected_info_type == "castle_v6":
             st.session_state['race_result'] = calculate_castle_v6_prediction(jcd_code, rno, date_str, params=params_dict)
         elif selected_info_type == "predict":
@@ -566,20 +597,20 @@ if 'fetch_params' in st.session_state and 'race_result' in st.session_state:
             target_lines = res["va_lines"]
             
         else: # predict
-            st.subheader("🎯 【新・スコア買い目予想】 展示最速軸・センター波乱・大穴")
+            st.subheader("🎯 【スコア買い目予想】 本命・対抗・大穴")
             col1_p, col2_p, col3_p = st.columns(3)
             with col1_p:
-                st.success("■ 展示最速・直線攻め買い目（4点）")
+                st.success("■ 本命買い目（4点）")
                 for c, o in zip(res["honmei_lines"], res["honmei_odds"]):
                     o_str = f"{o:.1f}倍" if o > 0 else "--- 倍"
                     st.write(f"👉 **{c}** ({o_str})")
             with col2_p:
-                st.info("■ センターカド・波乱買い目（4点）")
+                st.info("■ 対抗買い目（4点）")
                 for c, o in zip(res["taikou_lines"], res["taikou_odds"]):
                     o_str = f"{o:.1f}倍" if o > 0 else "--- 倍"
                     st.write(f"👉 **{c}** ({o_str})")
             with col3_p:
-                st.warning("■ イン流れ・大穴万舟買い目（4点）")
+                st.warning("■ 大穴買い目（4点）")
                 for c, o in zip(res["oana_lines"], res["oana_odds"]):
                     o_str = f"{o:.1f}倍" if o > 0 else "--- 倍"
                     st.write(f"👉 **{c}** ({o_str})")
@@ -632,12 +663,15 @@ if 'fetch_params' in st.session_state and 'race_result' in st.session_state:
                 "艇番": f"{b_no}号艇",
                 "登番": d["toban"],
                 "合計点数": f"{d['total']:.1f} pt",
-                "①展示/コース基本": f"{d['p1']:.1f}",
-                "②勝率/能力指数": f"{d['p2']:.1f}",
-                "③波乱/隠れA級": f"{d['p3']:.1f}",
+                "①コース基本": f"{d['p1']:.1f}",
+                "②コース複勝率": f"{d['p2']:.1f}",
+                "③平均ST": f"{d['p3']:.1f}",
                 "④当地複勝": f"{d['p4']:.1f}",
                 "⑤最近勝率": f"{d['p5']:.1f}",
-                "⑥体重/各種補正": f"{d['p6']:.1f}"
+                "⑥体重補正": f"{d['p6']:.1f}",
+                "展示ボーナス": f"{d.get('p_ex', 0.0):.1f}",
+                "イン減点": f"{d.get('p_in_pen', 0.0):.1f}",
+                "隠れA級加点": f"{d.get('p_hidden', 0.0):.1f}"
             })
         st.dataframe(pd.DataFrame(table_score), use_container_width=True)
 
@@ -648,7 +682,7 @@ if 'fetch_params' in st.session_state and 'race_result' in st.session_state:
         d_str = fp['date_str']
         
         with tab0:
-            res_v6 = calculate_castle_v6_prediction(jcd, rno_val, d_str, params=params_dict)
+            res_v6 = calculate_castle_v6_prediction(jcd, rno_val, d_str, params=fp.get("params"))
             st.subheader("🏰【キャッスル式V6作戦】 予想＆オッズ")
             alerts = res_v6.get("alerts", [])
             if alerts:
@@ -665,22 +699,19 @@ if 'fetch_params' in st.session_state and 'race_result' in st.session_state:
                 for c, o in zip(res_v6["vb_lines"], res_v6["vb_odds"]):
                     o_str = f"{o:.1f}倍" if o > 0 else "---"
                     st.write(f"👉 **{c}** ({o_str})")
-            
+        
         with tab1:
             soup = fetch_boatrace_data("racelist", jcd, rno_val, d_str)
             parse_and_display_tables(soup, "出走表")
-            
+        
         with tab2:
             soup = fetch_boatrace_data("odds3t", jcd, rno_val, d_str)
             parse_and_display_tables(soup, "オッズ")
-            
+        
         with tab3:
             soup = fetch_boatrace_data("beforeinfo", jcd, rno_val, d_str)
             parse_and_display_tables(soup, "直前情報")
-            
+        
         with tab4:
             soup = fetch_boatrace_data("raceresult", jcd, rno_val, d_str)
             parse_and_display_tables(soup, "レース結果")
-    else:
-        soup = res.get("soup")
-        parse_and_display_tables(soup, fp["info_label"])
