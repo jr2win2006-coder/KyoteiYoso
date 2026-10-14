@@ -450,9 +450,9 @@ def parse_and_display_tables(soup, title_label: str):
         st.error(f"{title_label}: データ解析中にエラーが発生しました: {e}")
 
 # Streamlit 画面構成
-st.set_page_config(page_title="KyoteiYoso v10 - 競艇予想＆格言スジ買いシステム", layout="wide")
+st.set_page_config(page_title="KyoteiYoso 10/14版 - 競艇キャリブレーション済予想システム", layout="wide")
 st.title("🚤 KyoteiYoso 競艇スクレイピング＆予想・格言スジ買いシステム")
-st.caption("✨ 格言集スジ買い法則 ＆ 競艇場ローカルルール ＆ 番組マンのクセ解析 完全統合版")
+st.caption("✨ 10/12・10/13キャリブレーション完了 ＆ 10/14最新番組・fan2604.txt完全対応版")
 
 st.write("条件を入力して「データを取得」ボタンを押してください。データ取得後も予算金額はリアルタイムで自由に変更可能です。")
 
@@ -460,7 +460,7 @@ st.write("条件を入力して「データを取得」ボタンを押してく�
 col1, col2, col3, col4, col5 = st.columns(5)
 
 with col1:
-    selected_date = st.date_input("① 年月日を選択", value=datetime.date(2026, 10, 13))
+    selected_date = st.date_input("① 年月日を選択", value=datetime.date(2026, 10, 14))
     date_str = selected_date.strftime("%Y%m%d")
 
 with col2:
@@ -486,7 +486,7 @@ with col5:
     total_budget = st.number_input("⑤ 資金配分予算（円）", min_value=1000, max_value=500000, value=10000, step=1000)
 
 # ⚙️ 調整パラメータ設定フォーム（アコーディオン形式）
-with st.expander("⚙️ 予想調整パラメータ設定（10/12バックテスト最適化済み数値）", expanded=False):
+with st.expander("⚙️ 予想調整パラメータ設定（10/12・10/13 キャリブレーション最適化済み）", expanded=False):
     col_p1, col_p2, col_p3, col_p4 = st.columns(4)
     with col_p1:
         ex_top_bonus = st.number_input(
