@@ -150,75 +150,78 @@ def detect_hidden_a(toban, kyu, shouritsu, local_winrate=0.0):
 def generate_exact_boatrace_odds_order():
     """
     boatrace.jp 3連単オッズ (odds3t) HTML DOM (120点) 正しいRow-by-Row出現順
-    Table 1 (左側: 1着 1, 2, 3) 20行 x 3列 = 60点
-    Table 2 (右側: 1着 4, 5, 6) 20行 x 3列 = 60点
+    1行につき 1着 1, 2, 3, 4, 5, 6 号艇の全6列が横に並ぶ 20行 x 6列 = 120点
     """
     combinations = []
-    # Table 1: 1着 1, 2, 3
     for r in range(20):
-        for a in [1, 2, 3]:
+        for a in range(1, 7):
             b_list = [x for x in range(1, 7) if x != a]
             b = b_list[r // 4]
             c_list = [y for y in range(1, 7) if y != a and y != b]
             c = c_list[r % 4]
             combinations.append(f"{a}-{b}-{c}")
-            
-    # Table 2: 1着 4, 5, 6
-    for r in range(20):
-        for a in [4, 5, 6]:
-            b_list = [x for x in range(1, 7) if x != a]
-            b = b_list[r // 4]
-            c_list = [y for y in range(1, 7) if y != a and y != b]
-            c = c_list[r % 4]
-            combinations.append(f"{a}-{b}-{c}")
-            
     return combinations
 
 
 def parse_odds3t(soup):
     """
     3連単オッズHTMLから全120通りのオッズ辞書 {"1-2-3": 16.8, ...} を抽出
-    td.oddsPoint のみを取得し、span要素による240点重複を自動排除する
     """
     odds_dict = {}
     if not soup:
         return odds_dict
     
-    td_cells = [
-        td for td in soup.find_all("td")
-        if td.get("class") and any("oddsPoint" in c for c in td.get("class"))
-    ]
-    
-    val_list = []
-    for cell in td_cells:
-        txt = cell.get_text().strip()
-        try:
-            val = float(txt)
-            val_list.append(val)
-        except ValueError:
-            pass
-            
-    if len(val_list) == 240:
-        val_list = val_list[::2]
+    # 1. 組番テキスト直近パース（可能であれば最優先）
+    for td in soup.find_all(["td", "th"]):
+        txt = td.get_text().strip()
+        m = re.search(r"^([1-6])[-ー—–]([1-6])[-ー—–]([1-6])$", txt)
+        if m:
+            combo = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+            next_td = td.find_next_sibling("td")
+            if next_td:
+                try:
+                    val = float(next_td.get_text().strip())
+                    odds_dict[combo] = val
+                except ValueError:
+                    pass
+
+    # 2. 標準的な120点 DOM 順序パース
+    if len(odds_dict) < 100:
+        td_cells = [
+            td for td in soup.find_all("td")
+            if td.get("class") and any("oddsPoint" in c for c in td.get("class"))
+        ]
         
-    combos = generate_exact_boatrace_odds_order()
-    
-    if len(val_list) >= 120:
-        for idx, combo in enumerate(combos):
-            odds_dict[combo] = val_list[idx]
-    else:
+        val_list = []
         for cell in td_cells:
             txt = cell.get_text().strip()
-            parent = cell.parent
-            if parent:
-                p_txt = parent.get_text().strip()
-                m = re.search(r'([1-6])[-ー—]([1-6])[-ー—]([1-6])', p_txt)
-                if m:
-                    combo = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-                    try:
-                        odds_dict[combo] = float(txt)
-                    except ValueError:
-                        pass
+            try:
+                val = float(txt)
+                val_list.append(val)
+            except ValueError:
+                pass
+                
+        if len(val_list) == 240:
+            val_list = val_list[::2]
+            
+        combos = generate_exact_boatrace_odds_order()
+        
+        if len(val_list) >= 120:
+            for idx, combo in enumerate(combos):
+                odds_dict[combo] = val_list[idx]
+        else:
+            for cell in td_cells:
+                txt = cell.get_text().strip()
+                parent = cell.parent
+                if parent:
+                    p_txt = parent.get_text().strip()
+                    m = re.search(r'([1-6])[-ー—]([1-6])[-ー—]([1-6])', p_txt)
+                    if m:
+                        combo = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+                        try:
+                            odds_dict[combo] = float(txt)
+                        except ValueError:
+                            pass
     return odds_dict
 
 
